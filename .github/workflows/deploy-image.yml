@@ -1,0 +1,134 @@
+# Builds a container image, pushes it to the homelab's registry and deploys
+# it by setting the new tag in homelab-apps' images.json. Argo CD then rolls
+# it out.
+#
+# Called from the application repositories:
+#
+#   jobs:
+#     deploy:
+#       uses: markusa380/homelab-ci/.github/workflows/deploy-image.yml@main
+#       permissions:
+#         contents: read
+#         id-token: write
+#       with:
+#         image: cardlake
+#       secrets:
+#         homelab-apps-deploy-key: ${{ secrets.HOMELAB_APPS_DEPLOY_KEY }}
+#
+# The registry is reachable only through the tailnet. The job joins it as an
+# ephemeral device tagged tag:ci, via workload identity federation: Tailscale
+# accepts only this workflow file, run from one of markusa380's repositories,
+# and the tailnet policy lets tag:ci reach nothing but the registry.
+name: Deploy image
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Image name, the key in homelab-apps' images.json.
+        type: string
+        required: true
+      context:
+        description: Docker build context.
+        type: string
+        default: .
+      dockerfile:
+        description: Dockerfile, relative to the repository root. Defaults to <context>/Dockerfile.
+        type: string
+        default: ""
+      build-command:
+        description: >-
+          Builds the image instead of docker build. Must leave a local image
+          named $IMAGE_REF.
+        type: string
+        default: ""
+      nix:
+        description: Install Nix before building, e.g. for a build in nix develop.
+        type: boolean
+        default: false
+    secrets:
+      homelab-apps-deploy-key:
+        description: SSH deploy key with write access to markusa380/homelab-apps.
+        required: true
+
+env:
+  REGISTRY: registry.tail50426a.ts.net
+  # Workload identity federation credential in the Tailscale admin console.
+  # Neither value is secret.
+  TS_CLIENT_ID: Tg6oEVkTGz11CNTRL-kAZxbwAnHn11CNTRL
+  TS_AUDIENCE: api.tailscale.com/Tg6oEVkTGz11CNTRL-kAZxbwAnHn11CNTRL
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # One deploy per image at a time, in push order.
+    concurrency:
+      group: deploy-${{ inputs.image }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Tag
+        run: |
+          tag=${GITHUB_SHA::12}
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "IMAGE_REF=$REGISTRY/${{ inputs.image }}:$tag" >> "$GITHUB_ENV"
+
+      - uses: cachix/install-nix-action@v31
+        if: inputs.nix
+
+      - name: Build
+        env:
+          CONTEXT: ${{ inputs.context }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          BUILD_COMMAND: ${{ inputs.build-command }}
+        run: |
+          if [ -n "$BUILD_COMMAND" ]; then
+            bash -euo pipefail -c "$BUILD_COMMAND"
+          else
+            docker build -t "$IMAGE_REF" -f "${DOCKERFILE:-$CONTEXT/Dockerfile}" "$CONTEXT"
+          fi
+          docker image inspect "$IMAGE_REF" > /dev/null
+
+      - name: Join the tailnet
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ env.TS_CLIENT_ID }}
+          audience: ${{ env.TS_AUDIENCE }}
+          tags: tag:ci
+
+      - name: Push
+        run: docker push "$IMAGE_REF"
+
+      - uses: actions/checkout@v7
+        with:
+          repository: markusa380/homelab-apps
+          ssh-key: ${{ secrets.homelab-apps-deploy-key }}
+          path: homelab-apps
+
+      - name: Deploy
+        working-directory: homelab-apps
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          git config user.name "homelab-ci"
+          git config user.email "homelab-ci@users.noreply.github.com"
+          # Other deploys may push in between; rebase and retry.
+          for attempt in 1 2 3 4 5; do
+            git pull --rebase --quiet
+            jq --arg image "$IMAGE" --arg tag "$TAG" '.[$image] = $tag' images.json > images.json.new
+            mv images.json.new images.json
+            if git diff --quiet; then
+              echo "images.json already has $IMAGE:$TAG"
+              exit 0
+            fi
+            git commit --quiet -am "Deploy $IMAGE $TAG ($GITHUB_REPOSITORY@$GITHUB_SHA)"
+            if git push --quiet; then
+              echo "Deployed $IMAGE:$TAG"
+              exit 0
+            fi
+            git reset --quiet --hard "@{u}"
+            sleep $((attempt * 5))
+          done
+          echo "Could not push to homelab-apps" >&2
+          exit 1
