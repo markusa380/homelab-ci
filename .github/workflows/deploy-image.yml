@@ -101,7 +101,8 @@ jobs:
       # registry. Abort if this job can reach the homelab host itself.
       - name: Check isolation
         run: |
-          if timeout 5 bash -c '</dev/tcp/homelab.tail50426a.ts.net/22' 2>/dev/null; then
+          # The homelab's tailnet IP, so a DNS failure can't make this pass.
+          if timeout 5 bash -c '</dev/tcp/100.115.52.76/22' 2>/dev/null; then
             echo "::error::CI can reach the homelab over SSH; the tailnet policy is too open"
             exit 1
           fi
