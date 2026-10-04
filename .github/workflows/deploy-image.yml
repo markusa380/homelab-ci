@@ -97,6 +97,16 @@ jobs:
           audience: ${{ env.TS_AUDIENCE }}
           tags: tag:ci
 
+      # The tailnet policy must keep tag:ci away from everything but the
+      # registry. Abort if this job can reach the homelab host itself.
+      - name: Check isolation
+        run: |
+          if timeout 5 bash -c '</dev/tcp/homelab.tail50426a.ts.net/22' 2>/dev/null; then
+            echo "::error::CI can reach the homelab over SSH; the tailnet policy is too open"
+            exit 1
+          fi
+          echo "homelab:22 not reachable, as intended"
+
       - name: Push
         run: docker push "$IMAGE_REF"
 
